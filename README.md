@@ -104,15 +104,16 @@ If ports 5432 or 5672 are taken, set `POSTGRES_PORT` / `RABBITMQ_PORT` before `j
 
 ```
 similar_companies/
-  config.py       settings from environment variables
-  schema.sql      tables: companies, rejected_events, company_neighbours
-  normalize.py    pure functions: registration numbers, UTC timestamps, states, descriptions
-  validation.py   raw message -> clean event, or a rejection with a reason code
-  embedding.py    text to embed + embedders (fastembed model, hashing placeholder)
-  repository.py   newer-wins writes, strike-offs, quarantine
-  neighbours.py   similarity search: live exact scan + exact precomputed top 20
-  consumer.py     RabbitMQ -> validate -> embed -> write -> commit -> ack
-  api.py          FastAPI app
+  config.py              settings from environment variables
+  schema.sql             tables: companies, rejected_events, company_neighbours
+  normalize.py           pure functions: registration numbers, UTC timestamps, states, descriptions
+  validation.py          raw message -> clean event, or a rejection with a reason code
+  embedding.py           text to embed + embedders (fastembed model, hashing placeholder)
+  repository.py          newer-wins writes, strike-offs, quarantine
+  neighbours.py          similarity search: live exact scan + exact precomputed top 20
+  consumer.py            RabbitMQ -> validate -> embed -> write -> commit -> ack
+  api.py                 FastAPI app
+  reprocess_rejected.py  Replay quarantined messages after a fix
 scripts/          pipeline check, model evaluation, EDA, model peek
 tests/            unit, feed-contract, integration and end-to-end tests
 ```

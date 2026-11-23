@@ -37,13 +37,32 @@ class CountingEmbedder(HashingEmbedder):
 
 
 class BrokenEmbedder(HashingEmbedder):
+    """Fails on every call, counting the attempts."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
     def embed(self, texts):
+        self.attempts += 1
         raise RuntimeError("model crashed")
+
+
+class FlakyEmbedder(HashingEmbedder):
+    """Fails on the first `failures` calls, then works: a temporary model problem."""
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+
+    def embed(self, texts):
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("temporary model failure")
+        return super().embed(texts)
 
 
 @pytest.fixture
 def handler(test_db_url):
-    handler = MessageHandler(test_db_url, CountingEmbedder())
+    handler = MessageHandler(test_db_url, CountingEmbedder(), embed_retry_delays=(0, 0))
     handler.conn.execute("TRUNCATE companies, rejected_events, company_neighbours")
     yield handler
     handler.reconnect()  # the test may have closed it
@@ -116,12 +135,55 @@ def test_bad_message_is_quarantined_with_its_reason(handler):
     )
 
 
+def test_temporary_embedding_failure_is_retried_not_quarantined(handler):
+    handler.embedder = FlakyEmbedder(failures=2)
+    assert handler.handle(upsert("2026-08-14T10:00:00+08:00"), "m1") == APPLIED
+    assert handler.conn.execute("SELECT count(*) FROM rejected_events").fetchone()[0] == 0
+
+
 def test_unexpected_error_is_quarantined_not_raised(handler):
     handler.embedder = BrokenEmbedder()
     assert handler.handle(upsert("2026-08-14T10:00:00+08:00"), "m1") == REJECTED
+    assert handler.embedder.attempts == 3  # first try + 2 retries
     reason = handler.conn.execute("SELECT reason FROM rejected_events").fetchone()[0]
     assert reason == PROCESSING_ERROR
     assert handler.conn.execute("SELECT count(*) FROM companies").fetchone()[0] == 0  # rolled back
+
+
+def rejected_count(handler) -> int:
+    return handler.conn.execute("SELECT count(*) FROM rejected_events").fetchone()[0]
+
+
+def test_reprocess_restores_a_quarantined_company(handler):
+    handler.embedder = BrokenEmbedder()
+    handler.handle(upsert("2026-08-14T10:00:00+08:00"), "m1")
+    handler.embedder = CountingEmbedder()  # the model works again
+    assert handler.reprocess_rejected() == {APPLIED: 1}
+    assert row(handler) == ("active", "Sinar Teguh Bakery Sdn. Bhd.", True)
+    assert rejected_count(handler) == 0
+
+
+def test_reprocess_is_a_no_op_when_a_newer_update_arrived_meanwhile(handler):
+    handler.embedder = BrokenEmbedder()
+    handler.handle(upsert("2026-08-14T10:00:00+08:00", name="Old"), "m1")
+    handler.embedder = CountingEmbedder()
+    handler.handle(upsert("2026-08-14T12:00:00+08:00", name="New"), "m2")
+    assert handler.reprocess_rejected() == {SKIPPED: 1}
+    assert row(handler)[1] == "New"
+    assert rejected_count(handler) == 0
+
+
+def test_reprocess_keeps_messages_that_still_fail(handler):
+    handler.embedder = BrokenEmbedder()
+    handler.handle(upsert("2026-08-14T10:00:00+08:00"), "m1")
+    assert handler.reprocess_rejected() == {REJECTED: 1}
+    assert rejected_count(handler) == 1
+
+
+def test_reprocess_only_replays_the_given_reason(handler):
+    handler.handle(b"null", "m1")  # not_an_object
+    assert handler.reprocess_rejected() == {}
+    assert rejected_count(handler) == 1
 
 
 def test_database_outage_raises_transient_error_then_recovers(handler):

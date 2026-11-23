@@ -68,6 +68,19 @@ ON CONFLICT (message_id) DO NOTHING
 """
 
 
+def rejected_messages(conn: psycopg.Connection, reason: str) -> list[tuple[int, str | None, str]]:
+    """Quarantined messages with this reason, oldest first: (id, message_id, raw_body)."""
+    return conn.execute(
+        "SELECT id, message_id, raw_body FROM rejected_events WHERE reason = %s ORDER BY id",
+        (reason,),
+    ).fetchall()
+
+
+def delete_rejected(conn: psycopg.Connection, rejected_id: int) -> None:
+    """Remove a quarantined message once it has been reprocessed successfully."""
+    conn.execute("DELETE FROM rejected_events WHERE id = %s", (rejected_id,))
+
+
 def to_pgvector(values: Sequence[float]) -> str:
     """Format a vector as pgvector's text input, e.g. '[0.1,0.2]'."""
     return "[" + ",".join(f"{v:.8g}" for v in values) + "]"

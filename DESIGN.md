@@ -148,5 +148,6 @@ I used **Claude** (Anthropic, through claude.ai) throughout, to draft the code a
 | 23 Nov | Pipeline check, API | ~35 min |
 | 23 Nov | Neighbour cache, profiling | ~55 min |
 | 23 Nov | Model evaluation, final docs | ~20 min |
-| **Total** | | **~5 h 06 min** |
+| 23 Nov | Review fix: embedding retries, reprocess command, fresh-clone check	~30 min
+| **Total** | | **~5 h 36 min** |
 

@@ -7,9 +7,12 @@ The database commit always happens before the ack. A crash in between means Rabb
 redelivers the message, never that a company is lost, and a redelivery is harmless
 because every write is newer-wins (an equal timestamp is a no-op).
 
-Failures are split in two:
-- bad data (or an unexpected error on one message): stored in rejected_events, then acked,
-  so one poison message can never block the queue;
+Failures are split three ways:
+- bad data: stored in rejected_events with its reason, then acked;
+- an unexpected error on a valid message (e.g. the embedding model failing): the model
+  call is retried first; if it still fails, the message is quarantined as
+  `processing_error` and acked, so one poison message can never block the queue. Those
+  messages are replayed with `uv run python -m scripts.reprocess_rejected`;
 - database unreachable: the message goes back on the queue and the consumer waits for
   the database to return before taking more.
 """
@@ -36,14 +39,21 @@ PROCESSING_ERROR = "processing_error"
 TRANSIENT_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError)
 MAX_RECONNECT_WAIT_SECONDS = 30
 PROGRESS_EVERY = 500
+EMBED_RETRY_DELAYS = (0.5, 2.0)  # seconds to wait before the 2nd and 3rd embedding attempt
 
 
 class MessageHandler:
     """Processes one message body in one database transaction. Knows nothing about RabbitMQ."""
 
-    def __init__(self, database_url: str, embedder: Embedder) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        embedder: Embedder,
+        embed_retry_delays: tuple[float, ...] = EMBED_RETRY_DELAYS,
+    ) -> None:
         self.database_url = database_url
         self.embedder = embedder
+        self.embed_retry_delays = embed_retry_delays
         self.conn = psycopg.connect(database_url, autocommit=True)
 
     def handle(self, body: bytes, message_id: str) -> str:
@@ -54,12 +64,40 @@ class MessageHandler:
         except TRANSIENT_ERRORS:
             raise
         except Exception:
-            # A bug or data we didn't anticipate. Park it with the raw body so it can be
-            # replayed after a fix, instead of crashing or redelivering it forever.
-            logger.exception("unexpected error on message %s; quarantined", message_id)
+            # A bug, or a model failure that outlasted the retries. Park it with the raw body
+            # instead of crashing or redelivering it forever; replay it after the fix with
+            # scripts.reprocess_rejected.
+            logger.exception(
+                "unexpected error on message %s; quarantined as %s", message_id, PROCESSING_ERROR
+            )
             with self.conn.transaction():
                 repository.save_rejected(self.conn, message_id, decode(body), PROCESSING_ERROR)
             return REJECTED
+
+    def reprocess_rejected(self, reason: str = PROCESSING_ERROR) -> Counter:
+        """Replay quarantined messages with this reason through the normal handling.
+
+        Safe to run at any time: writes are newer-wins, so a message overtaken by a newer
+        update is a no-op. Each message gets one transaction: its quarantine row is deleted
+        only if processing succeeds; if it fails again, everything rolls back and it stays.
+        """
+        outcomes: Counter = Counter()
+        for rejected_id, message_id, raw_body in repository.rejected_messages(self.conn, reason):
+            try:
+                with self.conn.transaction():
+                    repository.delete_rejected(self.conn, rejected_id)
+                    outcome = self._process(raw_body.encode("utf-8"), message_id)
+                    if outcome == REJECTED:
+                        raise _StillRejected
+            except _StillRejected:
+                outcome = REJECTED  # still invalid; its reason was logged by _process
+            except TRANSIENT_ERRORS:
+                raise
+            except Exception:
+                logger.exception("message %s still fails; left in quarantine", message_id)
+                outcome = REJECTED
+            outcomes[outcome] += 1
+        return outcomes
 
     def reconnect(self) -> None:
         """Replace the database connection, waiting with exponential backoff until it works."""
@@ -99,9 +137,20 @@ class MessageHandler:
         neighbours.refresh_after_change(self.conn, event.registration_number)  # same transaction
         return APPLIED
 
+    def _embed(self, text: str) -> list[float]:
+        """Embed one text, retrying briefly so a temporary model failure doesn't quarantine
+        a valid message. The last failure propagates."""
+        for delay in self.embed_retry_delays:
+            try:
+                return self.embedder.embed([text])[0]
+            except Exception:
+                logger.warning("embedding failed; retrying in %ss", delay, exc_info=True)
+                time.sleep(delay)
+        return self.embedder.embed([text])[0]
+
     def _to_row(self, event: UpsertEvent) -> repository.CompanyUpsert:
         text = embedding_text(event)
-        (vector,) = self.embedder.embed([text])
+        vector = self._embed(text)
         return repository.CompanyUpsert(
             registration_number=event.registration_number,
             updated_at=event.updated_at,
@@ -113,6 +162,10 @@ class MessageHandler:
             embedding=vector,
             embedding_model=self.embedder.model_name,
         )
+
+
+class _StillRejected(Exception):
+    """A reprocessed message failed again; used to roll back its savepoint."""
 
 
 def decode(body: bytes) -> str:
