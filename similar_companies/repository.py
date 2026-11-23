@@ -7,6 +7,7 @@ newer than the stored one. Duplicates (equal time) and stale messages are no-ops
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import psycopg
 
@@ -25,6 +26,8 @@ class CompanyUpsert:
     embedding: Sequence[float]
     embedding_model: str
 
+
+SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 UPSERT_COMPANY = """
 INSERT INTO companies (
@@ -94,10 +97,27 @@ def save_rejected(
     conn.execute(SAVE_REJECTED, {"message_id": message_id, "raw_body": raw_body, "reason": reason})
 
 
-def stored_updated_at(conn: psycopg.Connection, registration_number: str) -> datetime | None:
-    """The updated_at currently stored for a company, or None if unknown. Lets the consumer skip
-    embedding work for stale events; the conditional writes above stay the real safeguard."""
+@dataclass(frozen=True)
+class StoredState:
+    """What the database currently holds for a company, as far as ordering is concerned."""
+
+    updated_at: datetime
+    status: str
+
+
+def stored_state(conn: psycopg.Connection, registration_number: str) -> StoredState | None:
+    """The stored updated_at and status of a company, or None if unknown.
+
+    Lets the consumer skip embedding work for stale or duplicate events and spot
+    reactivations; the conditional writes above remain the real safeguard.
+    """
     row = conn.execute(
-        "SELECT updated_at FROM companies WHERE registration_number = %s", (registration_number,)
+        "SELECT updated_at, status FROM companies WHERE registration_number = %s",
+        (registration_number,),
     ).fetchone()
-    return row[0] if row else None
+    return StoredState(*row) if row else None
+
+
+def apply_schema(conn: psycopg.Connection) -> None:
+    """Create the extension and tables if they don't exist yet (safe on every startup)."""
+    conn.execute(SCHEMA_PATH.read_text())

@@ -5,9 +5,10 @@ from datetime import UTC, datetime
 
 from similar_companies.repository import (
     CompanyUpsert,
+    StoredState,
     mark_struck_off,
     save_rejected,
-    stored_updated_at,
+    stored_state,
     upsert_company,
 )
 
@@ -86,10 +87,12 @@ def test_struck_off_before_any_upsert_creates_tombstone(db):
     assert upsert_company(db, make_company(T12)) is False  # older data can't resurrect it
 
 
-def test_stored_updated_at(db):
-    assert stored_updated_at(db, REG_NO) is None
+def test_stored_state(db):
+    assert stored_state(db, REG_NO) is None
     upsert_company(db, make_company(T10))
-    assert stored_updated_at(db, REG_NO) == T10
+    assert stored_state(db, REG_NO) == StoredState(T10, "active")
+    mark_struck_off(db, REG_NO, T14)
+    assert stored_state(db, REG_NO) == StoredState(T14, "struck_off")
 
 
 def test_rejected_message_saved_once(db):
