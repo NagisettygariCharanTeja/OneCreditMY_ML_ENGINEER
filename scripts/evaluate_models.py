@@ -13,8 +13,6 @@ candidates. Reported two ways:
   identical description, which every set-up (even word hashing) matches trivially; this
   version measures whether a model generalizes across wording and language.
 A random ranking would score the "random" row.
-
-Usage (from the repo root): uv run python -m scripts.evaluate_models [--models hashing ...]
 """
 
 import argparse
