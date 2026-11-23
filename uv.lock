@@ -156,6 +156,7 @@ dependencies = [
     { name = "aio-pika" },
     { name = "fastapi" },
     { name = "fastembed" },
+    { name = "numpy" },
     { name = "psycopg", extra = ["binary"] },
     { name = "uvicorn" },
 ]
@@ -172,6 +173,7 @@ requires-dist = [
     { name = "aio-pika" },
     { name = "fastapi", specifier = ">=0.165.0" },
     { name = "fastembed", specifier = ">=0.9.1" },
+    { name = "numpy", specifier = ">=2.5.5" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.9" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]

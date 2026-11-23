@@ -1,0 +1,22 @@
+{
+  "hashing (baseline)": {
+    "all": 0.9876190476190476,
+    "identical_text_excluded": 0.362962962962963
+  },
+  "bge-small-en-v1.5": {
+    "all": 0.9861375661375661,
+    "identical_text_excluded": 0.5215873015873016
+  },
+  "multilingual": {
+    "all": 0.9958730158730159,
+    "identical_text_excluded": 0.862010582010582
+  },
+  "multilingual, location stripped": {
+    "all": 0.995978835978836,
+    "identical_text_excluded": 0.8610582010582011
+  },
+  "multilingual + pseudo-relevance feedback": {
+    "all": 0.9967195767195767,
+    "identical_text_excluded": 0.8566137566137566
+  }
+}
