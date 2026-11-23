@@ -1,6 +1,7 @@
 """Consume company events from RabbitMQ and keep Postgres in sync with the registry.
 
-Per message: validate -> skip if not newer -> embed -> newer-wins write -> commit -> ack.
+Per message: validate -> skip if not newer -> embed -> newer-wins write -> refresh the
+neighbour cache -> commit -> ack.
 
 The database commit always happens before the ack. A crash in between means RabbitMQ
 redelivers the message, never that a company is lost, and a redelivery is harmless
@@ -22,14 +23,14 @@ from collections import Counter
 import aio_pika
 import psycopg
 
-from similar_companies import repository
+from similar_companies import neighbours, repository
 from similar_companies.config import Settings, load_settings
 from similar_companies.embedding import Embedder, create_embedder, embedding_text
 from similar_companies.validation import Rejection, StruckOffEvent, UpsertEvent, parse_event
 
 logger = logging.getLogger(__name__)
 
-QUEUE = "company-events" 
+QUEUE = "company-events"  # owned by the registry team: declared exactly as the producer does
 APPLIED, SKIPPED, REJECTED = "applied", "skipped", "rejected"
 PROCESSING_ERROR = "processing_error"
 TRANSIENT_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError)
@@ -93,7 +94,10 @@ class MessageHandler:
             if stored and stored.status == "struck_off":
                 logger.warning("reactivating struck-off company %s", event.registration_number)
             applied = repository.upsert_company(self.conn, self._to_row(event))
-        return APPLIED if applied else SKIPPED
+        if not applied:
+            return SKIPPED
+        neighbours.refresh_after_change(self.conn, event.registration_number)  # same transaction
+        return APPLIED
 
     def _to_row(self, event: UpsertEvent) -> repository.CompanyUpsert:
         text = embedding_text(event)
@@ -162,6 +166,9 @@ def main() -> None:
     embedder = create_embedder(settings.embedding_model)  # once, before taking any message
     handler = MessageHandler(settings.database_url, embedder)
     repository.apply_schema(handler.conn)
+    if not neighbours.is_complete(handler.conn):
+        logger.info("building the neighbour cache for existing companies")
+        neighbours.rebuild_all(handler.conn)
     try:
         asyncio.run(consume(settings, handler))
     except KeyboardInterrupt:

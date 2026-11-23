@@ -15,6 +15,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+from similar_companies import neighbours
 from similar_companies.api import create_app
 from similar_companies.repository import CompanyUpsert, mark_struck_off, upsert_company
 
@@ -38,7 +39,7 @@ COMPANIES = {
 @pytest.fixture
 def client(test_db_url):
     with psycopg.connect(test_db_url, autocommit=True) as conn:
-        conn.execute("TRUNCATE companies, rejected_events")
+        conn.execute("TRUNCATE companies, rejected_events, company_neighbours")
         for number, (name, vector) in COMPANIES.items():
             upsert_company(
                 conn,
@@ -55,8 +56,9 @@ def client(test_db_url):
                 ),
             )
         mark_struck_off(conn, "SYN-000005", datetime(2026, 8, 15, tzinfo=UTC))
+        neighbours.rebuild_all(conn)
         yield TestClient(create_app(test_db_url))
-        conn.execute("TRUNCATE companies, rejected_events")
+        conn.execute("TRUNCATE companies, rejected_events, company_neighbours")
 
 
 def numbers(response) -> list[str]:
@@ -112,6 +114,13 @@ def test_struck_off_company_is_410(client):
     response = client.get("/companies/SYN-000005/similar")
     assert response.status_code == 410
     assert "struck off" in response.json()["detail"]
+
+
+def test_same_answer_with_and_without_the_cache(client, test_db_url):
+    cached = client.get("/companies/SYN-000001/similar").json()
+    with psycopg.connect(test_db_url, autocommit=True) as conn:
+        conn.execute("TRUNCATE company_neighbours")  # forces the live fallback
+    assert client.get("/companies/SYN-000001/similar").json() == cached
 
 
 def test_health(client):

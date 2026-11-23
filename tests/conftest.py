@@ -14,6 +14,12 @@ TEST_DB_NAME = "companies_test"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "similar_companies" / "schema.sql"
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "slow: replays the whole feed (1-2 minutes); skip with -m 'not slow'"
+    )
+
+
 @pytest.fixture(scope="session")
 def test_db_url() -> str:
     """Create a fresh test database once per test run and apply schema.sql to it."""

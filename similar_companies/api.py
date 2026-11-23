@@ -7,9 +7,10 @@ GET /companies/{registration_number}/similar?limit=5
   422  the registration number or limit is malformed
   503  the database is unreachable
 
-The search runs inside Postgres with pgvector: an exact cosine scan over active companies,
-excluding the company itself, with the registration number as a tie-breaker so results
-are reproducible (many companies share an identical description).
+The search runs inside Postgres with pgvector (see neighbours.py): candidates come from the
+precomputed neighbour cache, re-checked against live data, with the exact cosine scan as the
+fallback. Ties are broken by registration number, so results are reproducible (many
+companies share an identical description).
 """
 
 import psycopg
@@ -18,24 +19,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
+from similar_companies import neighbours
 from similar_companies.config import load_settings
 from similar_companies.normalize import normalize_registration_number
 
 MAX_LIMIT = 50
 
 COMPANY_STATUS = "SELECT status FROM companies WHERE registration_number = %(reg)s"
-
-SIMILAR_COMPANIES = """
-WITH target AS (
-    SELECT embedding FROM companies WHERE registration_number = %(reg)s
-)
-SELECT c.registration_number, c.company_name, c.industry, c.state,
-       1 - (c.embedding <=> target.embedding) AS similarity
-FROM companies AS c, target
-WHERE c.status = 'active' AND c.registration_number <> %(reg)s
-ORDER BY c.embedding <=> target.embedding, c.registration_number
-LIMIT %(limit)s
-"""
 
 
 class CamelModel(BaseModel):
@@ -86,16 +76,16 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 raise HTTPException(404, f"company {reg_no} not found")
             if row[0] == "struck_off":
                 raise HTTPException(410, f"company {reg_no} has been struck off")
-            rows = conn.execute(SIMILAR_COMPANIES, params).fetchall()
+            results = neighbours.similar(conn, reg_no, limit)
         cards = [
             CompanyCard(
-                registration_number=number,
-                company_name=name,
-                industry=industry,
-                state=state,
-                similarity=round(similarity, 4),
+                registration_number=n.registration_number,
+                company_name=n.company_name,
+                industry=n.industry,
+                state=n.state,
+                similarity=round(n.similarity, 4),
             )
-            for number, name, industry, state, similarity in rows
+            for n in results
         ]
         return SimilarCompanies(registration_number=reg_no, similar=cards)
 

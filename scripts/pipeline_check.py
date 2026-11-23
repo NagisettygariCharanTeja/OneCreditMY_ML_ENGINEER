@@ -7,12 +7,15 @@
    every active company embedded with the configured model.
 5. Publishes the whole feed again (every message duplicated) and checks that nothing the
    portal can see has changed.
-6. Starts the API on that database and checks 200 / 410 / 404 / 422, that no result is the
-   company itself or struck off, and the response time; prints the panel for SYN-001550,
-   the company in the README's mock.
+6. Checks the neighbour cache equals the live search, then starts the API on that
+   database and checks 200 / 410 / 404 / 422, that no result is the company itself or
+   struck off, and the response time; prints the panel for SYN-001550, the company in
+   the README's mock.
 
-It writes to its own database (companies_pipeline_check) so normal `companies` data
+It writes to its own database (companies_pipeline_check) so your normal `companies` data
 is untouched. Needs `just up` first; uses the same settings as the consumer.
+
+Usage (from the repo root): uv run python -m scripts.pipeline_check
 """
 
 import asyncio
@@ -31,6 +34,7 @@ from urllib.request import urlopen
 import aio_pika
 import psycopg
 
+from similar_companies import neighbours
 from similar_companies.config import load_settings
 from similar_companies.consumer import QUEUE
 
@@ -156,7 +160,16 @@ def check_api(conn: psycopg.Connection, env: dict) -> list[tuple[str, bool, str]
             returned = {card["registrationNumber"] for card in result["similar"]}
             clean = clean and number not in returned and not returned & struck_off
         p95 = statistics.quantiles(timings, n=20)[-1]
+        cache_exact = neighbours.is_complete(conn) and all(
+            neighbours.similar(conn, number, 5) == neighbours.live_similar(conn, number, 5)
+            for number in sample
+        )
         return [
+            (
+                "neighbour cache complete and equal to the live search (50 companies)",
+                cache_exact,
+                "",
+            ),
             ("API 200 with 5 cards for the mock company", status == 200 and len(cards) == 5, ""),
             (
                 "API never returns itself or struck-off (51 companies)",

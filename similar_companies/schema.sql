@@ -32,3 +32,15 @@ CREATE TABLE IF NOT EXISTS rejected_events (
 
 -- No vector index on purpose: at ~2,000 rows an exact scan takes milliseconds and
 -- always returns the true nearest neighbours. See DESIGN.md (10x volume) for HNSW.
+
+-- Precomputed nearest neighbours: each active company's top 20 active neighbours, kept
+-- exact by the consumer in the same transaction as every write (see neighbours.py).
+-- The API reads candidates from here, then re-checks status and live vectors.
+CREATE TABLE IF NOT EXISTS company_neighbours (
+    registration_number text NOT NULL REFERENCES companies ON DELETE CASCADE,
+    rank                integer NOT NULL,                -- 1 = most similar
+    neighbour           text NOT NULL REFERENCES companies ON DELETE CASCADE,
+    distance            double precision NOT NULL,      -- cosine distance when computed
+    PRIMARY KEY (registration_number, rank)
+);
+CREATE INDEX IF NOT EXISTS company_neighbours_neighbour_idx ON company_neighbours (neighbour);

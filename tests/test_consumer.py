@@ -1,4 +1,8 @@
 """Integration tests for the consumer's message handling, against real Postgres.
+
+RabbitMQ is not needed here: MessageHandler is the part that decides what happens to a
+message. The replay tests push every line of the real feed through it, the way the queue
+would deliver them, including shuffled order and redelivered duplicates.
 """
 
 import hashlib
@@ -18,6 +22,7 @@ from similar_companies.consumer import (
 )
 from similar_companies.embedding import HashingEmbedder
 from tests.test_feed_contract import FEED_PATH
+from tests.test_neighbours import assert_cache_exact
 
 
 class CountingEmbedder(HashingEmbedder):
@@ -39,10 +44,12 @@ class BrokenEmbedder(HashingEmbedder):
 @pytest.fixture
 def handler(test_db_url):
     handler = MessageHandler(test_db_url, CountingEmbedder())
-    handler.conn.execute("TRUNCATE companies, rejected_events")
+    handler.conn.execute("TRUNCATE companies, rejected_events, company_neighbours")
     yield handler
     handler.reconnect()  # the test may have closed it
-    handler.conn.execute("TRUNCATE companies, rejected_events")  # leave nothing for other tests
+    handler.conn.execute(
+        "TRUNCATE companies, rejected_events, company_neighbours"
+    )  # leave nothing for other tests
     handler.conn.close()
 
 
@@ -153,6 +160,7 @@ def visible_state(conn: psycopg.Connection) -> tuple[list[tuple], ...]:
     return active, struck_off, rejected
 
 
+@pytest.mark.slow
 def test_replaying_the_feed_gives_the_expected_end_state(handler):
     for body, message_id in feed_messages():
         handler.handle(body, message_id)
@@ -165,18 +173,21 @@ def test_replaying_the_feed_gives_the_expected_end_state(handler):
         "SELECT count(*) FROM companies WHERE status = 'active' AND embedding IS NULL"
     ).fetchone()[0]
     assert missing_embeddings == 0
+    assert_cache_exact(handler.conn)  # cached top 20 == live search for all 1,992 companies
 
 
+@pytest.mark.slow
 def test_visible_state_does_not_depend_on_order_or_duplicates(handler):
     messages = feed_messages()
     for body, message_id in messages:
         handler.handle(body, message_id)
     in_order = visible_state(handler.conn)
 
-    handler.conn.execute("TRUNCATE companies, rejected_events")
+    handler.conn.execute("TRUNCATE companies, rejected_events, company_neighbours")
     scrambled = messages * 2  # every message delivered twice...
     random.Random(42).shuffle(scrambled)  # ...in a random (but repeatable) order
     for body, message_id in scrambled:
         handler.handle(body, message_id)
 
     assert visible_state(handler.conn) == in_order
+    assert_cache_exact(handler.conn)
