@@ -17,6 +17,7 @@ from similar_companies.normalize import (
     normalize_state,
     normalize_updated_at,
 )
+from similar_companies.validation import Rejection, parse_event
 
 FEED_PATH = Path(__file__).resolve().parent.parent / "data" / "feed.jsonl"
 
@@ -75,3 +76,20 @@ def test_descriptions(records):
     assert outcomes["none"] == 58  # 29 null + 14 missing key + 15 empty
     assert outcomes["changed"] == 7  # the messages carrying repeated-phrase descriptions
     assert max(len(clean_description(r.get("natureOfBusiness")) or "") for r in records) < 200
+
+
+def test_validation_outcomes_on_real_feed():
+    """Every line of the feed through parse_event, counted per outcome (before any dedup)."""
+    outcomes = Counter()
+    for line in FEED_PATH.read_text(encoding="utf-8").splitlines():
+        result = parse_event(line)
+        outcomes[result.reason if isinstance(result, Rejection) else type(result).__name__] += 1
+    assert outcomes == {
+        "UpsertEvent": 2473,
+        "StruckOffEvent": 8,
+        "invalid_json": 5,
+        "not_an_object": 6,
+        "invalid_registration_number": 10,  # 7 missing + 3 integers
+        "invalid_updated_at": 7,
+        "invalid_data": 9,  # 5 without data + 4 with data as a string
+    }
