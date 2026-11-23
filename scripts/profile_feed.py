@@ -2,8 +2,10 @@
 
 Prints the data-quality findings the consumer has to handle: parse failures,
 schema variants, identifier and timestamp formats, duplicates, out-of-order
-updates and field values.
+updates and field values. Uses the consumer's own normalizers, so the EDA and
+the consumer can never disagree about a rule.
 
+Usage (from the repo root): uv run python -m scripts.profile_feed [--file data/feed.jsonl]
 """
 
 import argparse
@@ -11,12 +13,18 @@ import json
 import re
 import statistics
 from collections import Counter, defaultdict
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
-MYT = timezone(timedelta(hours=8))  # Malaysia time
-REG_NO_PATTERN = re.compile(r"SYN-\d{6}")
+from similar_companies.normalize import (
+    MALAYSIA_TIME,
+    normalize_registration_number,
+    normalize_state,
+    normalize_updated_at,
+)
+
 OFFSET_PATTERN = re.compile(r"[+-]\d\d:\d\d$")
+MISSING = object()  # marks an absent key, so it is never confused with a null value
 
 
 def section(title: str) -> None:
@@ -49,51 +57,52 @@ def timestamp_format(value: object) -> str:
     return f"other:{type(value).__name__}"
 
 
-def to_utc(value: object, naive_tz: timezone) -> datetime | None:
-    """Convert any known updatedAt format to UTC. naive_tz is the assumption for naive strings."""
-    if isinstance(value, int):
-        return datetime.fromtimestamp(value / 1000, UTC)
-    if isinstance(value, str):
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return (dt if dt.tzinfo else dt.replace(tzinfo=naive_tz)).astimezone(UTC)
-    return None
-
-
-def normalize_reg_no(value: object) -> str | None:
-    """Trim and uppercase string IDs. Non-strings are not guessed at."""
-    if not isinstance(value, str):
-        return None
-    candidate = value.strip().upper()
-    return candidate if REG_NO_PATTERN.fullmatch(candidate) else None
-
-
 def reg_no_shape(value: object) -> str:
+    """Show the shape of a registration number with digits masked, e.g. ' SYN-999999 '."""
     if value is None:
         return "missing"
     if not isinstance(value, str):
         return f"type:{type(value).__name__}"
-    return re.sub(r"\d", "9", value)  # e.g. " SYN-999999 "
+    return re.sub(r"\d", "9", value)
+
+
+def count_field(records: list[dict], field: str) -> tuple[Counter, int, int]:
+    """Count a field's values; return (values, null_count, missing_key_count) separately."""
+    values = Counter(record.get(field, MISSING) for record in records)
+    return values, values.pop(None, 0), values.pop(MISSING, 0)
+
+
+def naive_as(value: str, tz: timezone) -> datetime:
+    """Read a timestamp without a timezone as if it were in `tz`, converted to UTC.
+
+    Deliberately separate from normalize_updated_at: this tests the hypothesis
+    (UTC vs Malaysia time) that normalize_updated_at then relies on.
+    """
+    return datetime.fromisoformat(value).replace(tzinfo=tz).astimezone(UTC)
 
 
 def naive_timezone_evidence(events: list[tuple[int, dict]]) -> None:
-    """Test the assumption that naive timestamps are Malaysia time.
+    """Test the assumption that timestamps without a timezone are Malaysia time.
 
-    The feed is roughly in time order, so a correctly converted timestamp should sit
-    close to the timestamps of nearby offset-bearing lines. Compare the median gap
-    under 'naive = UTC' vs 'naive = MYT'.
+    The feed is roughly in time order, so a correctly read timestamp should sit close
+    to the timestamps of nearby lines that carry an explicit offset. Compare the median
+    gap under 'naive = UTC' vs 'naive = Malaysia time'.
     """
     anchors = [
-        (line_no, to_utc(e["updatedAt"], MYT))
+        (line_no, normalize_updated_at(e["updatedAt"]))
         for line_no, e in events
         if timestamp_format(e.get("updatedAt")) == "iso-offset"
     ]
-    for label, tz in (("naive treated as UTC", UTC), ("naive treated as MYT", MYT)):
+    naive = [
+        (n, e["updatedAt"])
+        for n, e in events
+        if timestamp_format(e.get("updatedAt")) == "iso-naive"
+    ]
+    for label, tz in (("naive treated as UTC", UTC), ("naive treated as MYT", MALAYSIA_TIME)):
         gaps = []
-        for line_no, e in events:
-            if timestamp_format(e.get("updatedAt")) != "iso-naive":
-                continue
+        for line_no, value in naive:
             nearest = min(anchors, key=lambda anchor: abs(anchor[0] - line_no))
-            gaps.append(abs((to_utc(e["updatedAt"], tz) - nearest[1]).total_seconds()) / 60)
+            gaps.append(abs((naive_as(value, tz) - nearest[1]).total_seconds()) / 60)
         print(f"  {label:<24} median gap to nearest neighbour: {statistics.median(gaps):7.1f} min")
 
 
@@ -106,9 +115,10 @@ def main() -> None:
     events = [(n, obj) for n, obj in parsed if isinstance(obj, dict)]
 
     section("Volume and parsing")
-    print(f"  lines: {len(lines)}   blank: {sum(1 for l in lines if not l.strip())}")
+    print(f"  lines: {len(lines)}   blank: {sum(1 for line in lines if not line.strip())}")
     print(f"  unparseable JSON: {len(failed)}  (lines {[n for n, _ in failed]})")
-    print(f"  parsed but not an object: {Counter(type(o).__name__ for _, o in parsed if not isinstance(o, dict))}")
+    not_objects = Counter(type(o).__name__ for _, o in parsed if not isinstance(o, dict))
+    print(f"  parsed but not an object: {dict(not_objects)}")
     print(f"  identical duplicate lines (extra copies): {len(lines) - len(set(lines))}")
 
     section("Event types and top-level keys")
@@ -117,55 +127,68 @@ def main() -> None:
         print(f"  {count:5}  {keys}")
 
     section("registrationNumber")
-    for shape, count in Counter(reg_no_shape(e.get("registrationNumber")) for _, e in events).most_common():
+    shapes = Counter(reg_no_shape(e.get("registrationNumber")) for _, e in events)
+    for shape, count in shapes.most_common():
         print(f"  {count:5}  {shape!r}")
-    companies = {normalize_reg_no(e.get("registrationNumber")) for _, e in events} - {None}
-    print(f"  distinct companies after trim + uppercase: {len(companies)}")
+    companies = {normalize_registration_number(e.get("registrationNumber")) for _, e in events}
+    print(f"  distinct companies after trim + uppercase: {len(companies - {None})}")
 
     section("updatedAt")
-    for fmt, count in Counter(timestamp_format(e.get("updatedAt")) for _, e in events).most_common():
+    formats = Counter(timestamp_format(e.get("updatedAt")) for _, e in events)
+    for fmt, count in formats.most_common():
         print(f"  {count:5}  {fmt}")
     naive_timezone_evidence(events)
 
     section("data field")
-    print(f"  data type: {dict(Counter(type(e.get('data')).__name__ if 'data' in e else 'missing' for _, e in events))}")
+    data_types = Counter(type(e["data"]).__name__ if "data" in e else "missing" for _, e in events)
+    print(f"  data type: {dict(data_types)}")
     records = [e["data"] for _, e in events if isinstance(e.get("data"), dict)]
     for keys, count in Counter(tuple(sorted(d)) for d in records).most_common():
         print(f"  {count:5}  {keys}")
-    print(f"  companyName values that look like placeholders: "
-          f"{dict(Counter(d.get('companyName') for d in records if d.get('companyName') in {'Unknown', 'X', 'Foo'}))}")
+    placeholders = Counter(
+        d.get("companyName") for d in records if d.get("companyName") in {"Unknown", "X", "Foo"}
+    )
+    print(f"  companyName values that look like placeholders: {dict(placeholders)}")
 
     section("Field values")
-    MISSING = object()
-    descriptions = Counter(d.get("natureOfBusiness", MISSING) for d in records)
-    missing_key = descriptions.pop(MISSING, 0)
-    print(f"  natureOfBusiness: distinct {len(descriptions)}, null {descriptions[None]}, missing key {missing_key}, empty {descriptions['']}")
+    descriptions, null_desc, missing_desc = count_field(records, "natureOfBusiness")
+    empty_desc = descriptions.pop("", 0)
+    print(
+        f"  natureOfBusiness: distinct {len(descriptions)}, null {null_desc},"
+        f" missing key {missing_desc}, empty {empty_desc}"
+    )
     long_ones = [text for text in descriptions if isinstance(text, str) and len(text) > 200]
-    print(f"  descriptions longer than 200 chars: {len(long_ones)}  (e.g. {long_ones[0][:60]!r}...)")
+    print(
+        f"  descriptions longer than 200 chars: {len(long_ones)}  (e.g. {long_ones[0][:60]!r}...)"
+    )
 
-    states = Counter(d.get("state", MISSING) for d in records)
-    missing_state = states.pop(MISSING, 0)
-    null_state = states.pop(None, 0)
-    canonical_states = {s.strip().title() for s in states if isinstance(s, str)}
-    print(f"  state: {len(states)} raw spellings -> {len(canonical_states)} after title-case, null {null_state}, missing key {missing_state}")
-    
-    industry = Counter(d.get('industry', MISSING) for d in records)
-    missing_industry = industry.pop(MISSING, 0)
-    print(f"  industry: {dict(industry.most_common())}, missing {missing_industry}")
+    states, null_state, missing_state = count_field(records, "state")
+    known_states = {normalize_state(raw) for raw in states} - {None}
+    print(
+        f"  state: {len(states)} raw spellings -> {len(known_states)} known states,"
+        f" null {null_state}, missing key {missing_state}"
+    )
+
+    industries, null_industry, missing_industry = count_field(records, "industry")
+    print(
+        f"  industry: {dict(industries.most_common())},"
+        f" null {null_industry}, missing key {missing_industry}"
+    )
 
     section("History per company (time-ordered, naive = MYT)")
     history = defaultdict(list)
     for line_no, e in events:
-        reg_no = normalize_reg_no(e.get("registrationNumber"))
+        reg_no = normalize_registration_number(e.get("registrationNumber"))
         if reg_no:
             history[reg_no].append((line_no, e))
-    print(f"  events per company: {dict(sorted(Counter(len(v) for v in history.values()).items()))}")
+    events_per_company = Counter(len(v) for v in history.values())
+    print(f"  events per company: {dict(sorted(events_per_company.items()))}")
 
     stale = 0
     for company_events in history.values():
         newest = None
         for _, e in company_events:  # arrival order
-            ts = to_utc(e.get("updatedAt"), MYT)
+            ts = normalize_updated_at(e.get("updatedAt"))
             if ts is None:
                 continue
             if newest and ts < newest:
@@ -174,12 +197,20 @@ def main() -> None:
     print(f"  stale arrivals (older updatedAt than one already seen): {stale}")
 
     no_description = [
-        reg_no for reg_no, company_events in history.items()
-        if not any(isinstance(e.get("data"), dict) and e["data"].get("natureOfBusiness") for _, e in company_events)
+        reg_no
+        for reg_no, company_events in history.items()
+        if not any(
+            isinstance(e.get("data"), dict) and e["data"].get("natureOfBusiness")
+            for _, e in company_events
+        )
     ]
     print(f"  companies with no non-empty description in any event: {len(no_description)}")
-    struck = [reg_no for reg_no, ce in history.items() if any(e.get("type") == "company-struck-off" for _, e in ce)]
-    print(f"  struck-off companies: {len(struck)}  {sorted(struck)}")
+    struck = sorted(
+        reg_no
+        for reg_no, company_events in history.items()
+        if any(e.get("type") == "company-struck-off" for _, e in company_events)
+    )
+    print(f"  struck-off companies: {len(struck)}  {struck}")
 
 
 if __name__ == "__main__":

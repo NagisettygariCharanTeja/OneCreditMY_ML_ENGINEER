@@ -1,4 +1,4 @@
-"""Integration tests: the database schema enforces data rules on its own."""
+"""Integration tests: the database schema enforces our data rules on its own."""
 
 import psycopg
 import pytest
@@ -52,9 +52,13 @@ def test_rejected_body_may_be_invalid_json(db):
 
 def test_same_rejected_message_is_stored_once(db):
     insert = (
-        "INSERT INTO rejected_events (message_id, raw_body, reason) VALUES ('m2', 'null', 'not_an_object')"
+        "INSERT INTO rejected_events (message_id, raw_body, reason)"
+        " VALUES ('m2', 'null', 'not_an_object')"
         " ON CONFLICT (message_id) DO NOTHING"
     )
     db.execute(insert)
     db.execute(insert)
-    assert db.execute("SELECT count(*) FROM rejected_events WHERE message_id = 'm2'").fetchone()[0] == 1
+    assert (
+        db.execute("SELECT count(*) FROM rejected_events WHERE message_id = 'm2'").fetchone()[0]
+        == 1
+    )

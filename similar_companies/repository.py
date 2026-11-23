@@ -76,13 +76,20 @@ def upsert_company(conn: psycopg.Connection, company: CompanyUpsert) -> bool:
     return conn.execute(UPSERT_COMPANY, params).fetchone() is not None
 
 
-def mark_struck_off(conn: psycopg.Connection, registration_number: str, updated_at: datetime) -> bool:
-    """Mark a company struck off (or create a tombstone) if this event is newer. Returns True if applied."""
+def mark_struck_off(
+    conn: psycopg.Connection, registration_number: str, updated_at: datetime
+) -> bool:
+    """Mark a company struck off, or create a tombstone, if this event is newer.
+
+    Returns True if it was applied.
+    """
     params = {"registration_number": registration_number, "updated_at": updated_at}
     return conn.execute(MARK_STRUCK_OFF, params).fetchone() is not None
 
 
-def save_rejected(conn: psycopg.Connection, message_id: str | None, raw_body: str, reason: str) -> None:
+def save_rejected(
+    conn: psycopg.Connection, message_id: str | None, raw_body: str, reason: str
+) -> None:
     """Quarantine a message the consumer cannot use. A redelivered message is stored once."""
     conn.execute(SAVE_REJECTED, {"message_id": message_id, "raw_body": raw_body, "reason": reason})
 

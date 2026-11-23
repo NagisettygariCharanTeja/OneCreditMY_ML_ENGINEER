@@ -1,0 +1,9 @@
+# Lint and format settings for my code. Kept in its own file so the template's
+# pyproject.toml only changes through `uv add` (dependencies), as the README suggests.
+line-length = 100
+
+# The producer is the registry team's code in this scenario: never lint or reformat it.
+extend-exclude = ["producer"]
+
+[lint]
+select = ["E", "F", "I", "B", "UP"]
