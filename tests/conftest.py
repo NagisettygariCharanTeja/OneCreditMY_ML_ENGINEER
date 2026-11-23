@@ -6,7 +6,7 @@ from pathlib import Path
 import psycopg
 import pytest
 
-# Admin connection to the docker-compose Postgres; override with TEST_ADMIN_DATABASE_URL.
+# Admin connection to the docker-compose Postgres
 ADMIN_URL = os.environ.get(
     "TEST_ADMIN_DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres"
 )

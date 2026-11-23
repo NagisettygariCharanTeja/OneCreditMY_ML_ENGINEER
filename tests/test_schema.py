@@ -1,4 +1,4 @@
-"""Integration tests: the database schema enforces our data rules on its own."""
+"""Integration tests: the database schema enforces data rules on its own."""
 
 import psycopg
 import pytest
