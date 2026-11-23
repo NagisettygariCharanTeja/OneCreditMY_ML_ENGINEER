@@ -3,20 +3,30 @@
 1. Publishes the feed with the template's producer.
 2. Starts the consumer, then kills it with SIGKILL part-way through (a hard crash).
 3. Restarts it and waits until the queue is drained.
-4. Publishes the whole feed again (every message duplicated) and checks that nothing the
+4. Checks the end state: 1,992 active + 8 struck-off companies, 32 quarantined messages,
+   every active company embedded with the configured model.
+5. Publishes the whole feed again (every message duplicated) and checks that nothing the
    portal can see has changed.
+6. Starts the API on that database and checks 200 / 410 / 404 / 422, that no result is the
+   company itself or struck off, and the response time; prints the panel for SYN-001550,
+   the company in the README's mock.
 
 It writes to its own database (companies_pipeline_check) so normal `companies` data
 is untouched. Needs `just up` first; uses the same settings as the consumer.
 """
 
 import asyncio
+import json
 import os
+import random
+import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
 
 import aio_pika
 import psycopg
@@ -29,6 +39,9 @@ KILL_AFTER_COMPANIES = 300  # crash the first consumer once this many companies 
 EXPECTED_STATUS = {"active": 1992, "struck_off": 8}
 EXPECTED_REJECTED = 32
 LOG_DIR = Path(tempfile.gettempdir())
+API_PORT = 8765  # not 8000, so it never clashes with an API you are running yourself
+API = f"http://127.0.0.1:{API_PORT}"
+MOCK_COMPANY = "SYN-001550"  # Sinar Teguh Bakery, the company in the README's mock panel
 
 FINGERPRINT_SQL = """
 SELECT md5(string_agg(
@@ -82,6 +95,90 @@ def start_consumer(env: dict, log_name: str) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-m", "similar_companies.consumer"], env=env, stdout=log, stderr=log
     )
+
+
+def get(path: str) -> tuple[int, dict]:
+    """GET from the API; returns (status code, JSON body) for success and errors alike."""
+    try:
+        with urlopen(API + path, timeout=10) as response:
+            return response.status, json.load(response)
+    except HTTPError as error:
+        return error.code, json.load(error)
+
+
+def start_api(env: dict) -> subprocess.Popen:
+    log = open(LOG_DIR / "pipeline_check_api.log", "w")  # left open for the child process
+    api = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "similar_companies.api:app", "--port", str(API_PORT)],
+        env=env,
+        stdout=log,
+        stderr=log,
+    )
+    for _ in range(60):
+        try:
+            if get("/health")[0] == 200:
+                return api
+        except URLError:
+            pass  # not listening yet
+        time.sleep(0.5)
+    api.kill()
+    sys.exit("API did not start; see pipeline_check_api.log")
+
+
+def check_api(conn: psycopg.Connection, env: dict) -> list[tuple[str, bool, str]]:
+    struck_off = {
+        r[0]
+        for r in conn.execute(
+            "SELECT registration_number FROM companies WHERE status = 'struck_off'"
+        )
+    }
+    active = [
+        r[0]
+        for r in conn.execute("SELECT registration_number FROM companies WHERE status = 'active'")
+    ]
+    api = start_api(env)
+    try:
+        status, body = get(f"/companies/{MOCK_COMPANY}/similar")
+        cards = body.get("similar", [])
+        numbers = [card["registrationNumber"] for card in cards]
+        print(f"\n   Similar companies for {MOCK_COMPANY}:")
+        for card in cards:
+            print(
+                f"   {card['similarity']:.3f}  {card['companyName']:<38}"
+                f" {card['industry'] or '-':<16} {card['state'] or '-'}"
+            )
+        sample = random.Random(7).sample(active, 50)
+        timings, clean = [], True
+        for number in sample:
+            started = time.perf_counter()
+            _, result = get(f"/companies/{number}/similar")
+            timings.append((time.perf_counter() - started) * 1000)
+            returned = {card["registrationNumber"] for card in result["similar"]}
+            clean = clean and number not in returned and not returned & struck_off
+        p95 = statistics.quantiles(timings, n=20)[-1]
+        return [
+            ("API 200 with 5 cards for the mock company", status == 200 and len(cards) == 5, ""),
+            (
+                "API never returns itself or struck-off (51 companies)",
+                clean and not set(numbers) & struck_off,
+                "",
+            ),
+            (
+                "API 410 for a struck-off company",
+                get(f"/companies/{min(struck_off)}/similar")[0] == 410,
+                "",
+            ),
+            ("API 404 for an unknown company", get("/companies/SYN-999999/similar")[0] == 404, ""),
+            ("API 422 for a malformed number", get("/companies/hello/similar")[0] == 422, ""),
+            (
+                "API response time",
+                p95 < 200,
+                f"median {statistics.median(timings):.1f} ms, p95 {p95:.1f} ms",
+            ),
+        ]
+    finally:
+        api.terminate()
+        api.wait()
 
 
 def publish_feed() -> None:
@@ -155,6 +252,9 @@ def main() -> None:
                 ("visible state unchanged after re-publish", before == after, ""),
                 ("quarantine unchanged after re-publish", rejected_after == rejected, ""),
             ]
+
+            print("5. starting the API on the same database")
+            results += check_api(conn, env)
     finally:
         consumer.terminate()
         consumer.wait()
