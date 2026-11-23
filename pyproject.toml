@@ -5,7 +5,13 @@ description = "Turn a company event feed into a similar-companies service with R
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "aio-pika",
+  "psycopg[binary]>=3.3.9",
 ]
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
